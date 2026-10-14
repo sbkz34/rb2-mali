@@ -1,0 +1,201 @@
+From 5bf25324ea608e910a16fde8f36d2d9be7f40696 Mon Sep 17 00:00:00 2001
+From: sbkz34 <sbkz34@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:29:16 +0200
+Subject: [PATCH] Run on Mali GPUs without vertexPipelineStoresAndAtomics
+
+Mali drivers (e.g. Mali-G720 on Dimensity 9400-class chips) do not expose
+vertexPipelineStoresAndAtomics, so the SDK refused the device and the game
+never started.
+
+The SDK already has the fallbacks: the SPIR-V translator leaves memory
+export out of vertex shaders when the feature is missing and marks the
+shared memory NonWritable. Only the hard checks stood in the way.
+
+- patch 0038: vulkan_require_vertex_pipeline_stores_and_atomics (until now
+  "deprecated and ignored") is honoured again, default false. Without the
+  feature the device is accepted, and vertex-shader memexport draws run
+  without the export instead of being dropped. vulkan_mask_features also
+  accepts vertexPipelineStoresAndAtomics, so the path can be tried on
+  Adreno.
+- launcher passes --vulkan_require_vertex_pipeline_stores_and_atomics=false
+  next to the existing Mali flags.
+- Vulkan probe and custom driver check no longer treat the feature as
+  required; the probe notes that vertex memexport is skipped.
+
+GPUs that have the feature are unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LeTb1XBJrgfnmVVgtyZpM3
+---
+ .../org/rb2recomp/android/LaunchConfig.java   |  3 +
+ android/native/src/custom_driver.cpp          |  3 +-
+ android/native/src/vulkan_probe.cpp           |  8 +-
+ ...optional-vertex-pipeline-stores-mali.patch | 98 +++++++++++++++++++
+ 4 files changed, 108 insertions(+), 4 deletions(-)
+ create mode 100644 patches/rexglue-sdk-android/0038-vulkan-optional-vertex-pipeline-stores-mali.patch
+
+diff --git a/android/app/src/main/java/org/rb2recomp/android/LaunchConfig.java b/android/app/src/main/java/org/rb2recomp/android/LaunchConfig.java
+index 419b63f..a7036c2 100644
+--- a/android/app/src/main/java/org/rb2recomp/android/LaunchConfig.java
++++ b/android/app/src/main/java/org/rb2recomp/android/LaunchConfig.java
+@@ -321,6 +321,9 @@ final class LaunchConfig {
+         // fallbacks for both (primitive expansion in the vertex shader, solid fill).
+         defaults.add("--vulkan_require_geometry_shader=false");
+         defaults.add("--vulkan_require_fill_mode_non_solid=false");
++        // Mali has no vertexPipelineStoresAndAtomics either: accept it and skip vertex shader memory
++        // export (patch 0038) instead of refusing to start.
++        defaults.add("--vulkan_require_vertex_pipeline_stores_and_atomics=false");
+         addDriverArguments(context, defaults);
+         for (String flag : PERFORMANCE) {
+             defaults.add(flag);
+diff --git a/android/native/src/custom_driver.cpp b/android/native/src/custom_driver.cpp
+index 1640228..4262a49 100755
+--- a/android/native/src/custom_driver.cpp
++++ b/android/native/src/custom_driver.cpp
+@@ -150,8 +150,7 @@ std::string Verify(void* handle) {
+     get_features(device, &features);
+     VkPhysicalDeviceProperties properties{};
+     get_properties(device, &properties);
+-    if (!features.independentBlend || !features.fragmentStoresAndAtomics ||
+-        !features.vertexPipelineStoresAndAtomics) {
++    if (!features.independentBlend || !features.fragmentStoresAndAtomics) {
+       problem = std::string("'") + properties.deviceName + "' lacks a required feature";
+     } else {
+       LOGI("custom driver sees '%s', Vulkan %u.%u", properties.deviceName,
+diff --git a/android/native/src/vulkan_probe.cpp b/android/native/src/vulkan_probe.cpp
+index db4fb2a..65308dd 100755
+--- a/android/native/src/vulkan_probe.cpp
++++ b/android/native/src/vulkan_probe.cpp
+@@ -127,8 +127,8 @@ std::string Probe() {
+     out += "  Features the SDK requires (vulkan_device.cpp):\n";
+     Feature(out, "independentBlend", f.independentBlend, true);
+     Feature(out, "fragmentStoresAndAtomics", f.fragmentStoresAndAtomics, true);
+-    Feature(out, "vertexPipelineStoresAndAtomics", f.vertexPipelineStoresAndAtomics, true);
+     out += "  Features it uses when present (fallback paths otherwise, e.g. Mali / PowerVR):\n";
++    Feature(out, "vertexPipelineStoresAndAtomics", f.vertexPipelineStoresAndAtomics, false);
+     Feature(out, "geometryShader", f.geometryShader, false);
+     Feature(out, "fillModeNonSolid", f.fillModeNonSolid, false);
+     Feature(out, "fullDrawIndexUint32", f.fullDrawIndexUint32, false);
+@@ -167,10 +167,14 @@ std::string Probe() {
+                  (families[q].queueFlags & VK_QUEUE_TRANSFER_BIT) ? " transfer" : "");
+     }
+ 
+-    const bool ok = f.independentBlend && f.fragmentStoresAndAtomics && f.vertexPipelineStoresAndAtomics &&
++    const bool ok = f.independentBlend && f.fragmentStoresAndAtomics &&
+                     HasExtension(extensions, "VK_KHR_swapchain");
+     out += ok ? "  VERDICT: has everything the SDK requires.\n"
+               : "  VERDICT: MISSING a required feature - the game will refuse to start on this GPU.\n";
++    if (ok && !f.vertexPipelineStoresAndAtomics) {
++      out += "  NOTE: no vertexPipelineStoresAndAtomics (Mali): vertex shader memory export is skipped,\n"
++             "        some effects may be missing.\n";
++    }
+   }
+ 
+   vkDestroyInstance(instance, nullptr);
+diff --git a/patches/rexglue-sdk-android/0038-vulkan-optional-vertex-pipeline-stores-mali.patch b/patches/rexglue-sdk-android/0038-vulkan-optional-vertex-pipeline-stores-mali.patch
+new file mode 100644
+index 0000000..346ecd5
+--- /dev/null
++++ b/patches/rexglue-sdk-android/0038-vulkan-optional-vertex-pipeline-stores-mali.patch
+@@ -0,0 +1,98 @@
++diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
++index 3b9c7ba..b8e8cdc 100644
++--- a/src/graphics/vulkan/command_processor.cpp
+++++ b/src/graphics/vulkan/command_processor.cpp
++@@ -1243,10 +1243,16 @@ bool VulkanCommandProcessor::SetupContext() {
++     return false;
++   }
++   if (!device_properties.vertexPipelineStoresAndAtomics) {
++-    REXGPU_ERROR(
++-        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
++-        "D3D12 parity, but unsupported by the selected device");
++-    return false;
+++    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
+++      REXGPU_ERROR(
+++          "Vulkan vertexPipelineStoresAndAtomics is required "
+++          "(vulkan_require_vertex_pipeline_stores_and_atomics=true), but unsupported by the "
+++          "selected device");
+++      return false;
+++    }
+++    REXGPU_WARN(
+++        "Vulkan vertexPipelineStoresAndAtomics is unsupported by the selected device; vertex "
+++        "shader memory export will be skipped");
++   }
++   if (!device_properties.geometryShader) {
++     if (REXCVAR_GET(vulkan_require_geometry_shader)) {
++@@ -4615,13 +4621,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
++   if (census && memexport_used_vertex) {
++     census_draw.flags |= draw_census::kDrawMemexportVertex;
++   }
++-  if (memexport_used_vertex) {
++-    if (!device_properties.vertexPipelineStoresAndAtomics) {
++-      REXGPU_ERROR(
++-          "Vertex shader memexport draw encountered without "
++-          "vertexPipelineStoresAndAtomics support");
++-      return false;
+++  if (memexport_used_vertex && !device_properties.vertexPipelineStoresAndAtomics) {
+++    // No vertex-stage storage writes on this GPU (Mali): the SPIR-V translator already leaves the
+++    // stores out of the vertex shader (IsMemoryExportSupported), so draw without the export
+++    // instead of dropping the whole draw.
+++    static uint64_t g_vertex_memexport_skipped = 0;
+++    if ((g_vertex_memexport_skipped++ & 0xFFFF) == 0) {
+++      REXGPU_WARN(
+++          "Vertex shader memexport skipped (no vertexPipelineStoresAndAtomics), {} draw(s) so far",
+++          g_vertex_memexport_skipped);
++     }
+++    memexport_used_vertex = false;
+++  }
+++  if (memexport_used_vertex) {
++     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
++   }
++ 
++diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
++index c413dda..57beea9 100644
++--- a/src/ui/vulkan/vulkan_device.cpp
+++++ b/src/ui/vulkan/vulkan_device.cpp
++@@ -26,9 +26,10 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan
++                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
++                     "required for Vulkan GPU emulation")
++     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++-REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
++-                    "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
++-                    "required for Vulkan GPU emulation")
+++REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, false, "UI/Vulkan",
+++                    "Refuse GPUs without vertexPipelineStoresAndAtomics (Mali). When false, such a "
+++                    "GPU is accepted and vertex shader memory export is skipped (draws still run; "
+++                    "effects that rely on vertex memexport may be missing)")
++     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++ // Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid;
++ // default both to false on macOS so the device can still be selected.
++@@ -114,6 +115,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
++     XE_UI_VULKAN_MASK(samplerAnisotropy)
++     XE_UI_VULKAN_MASK(fullDrawIndexUint32)
++     XE_UI_VULKAN_MASK(occlusionQueryPrecise)
+++    XE_UI_VULKAN_MASK(vertexPipelineStoresAndAtomics)
++ #undef XE_UI_VULKAN_MASK
++   }
++ 
++@@ -142,11 +144,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
++       return nullptr;
++     }
++     if (!supported_features.vertexPipelineStoresAndAtomics) {
+++      if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
+++        REXLOG_WARN(
+++            "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, but "
+++            "vulkan_require_vertex_pipeline_stores_and_atomics=true",
+++            properties.deviceName);
+++        return nullptr;
+++      }
++       REXLOG_WARN(
++-          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
++-          "is required for Vulkan GPU emulation parity",
+++          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics; vertex "
+++          "shader memory export will be skipped",
++           properties.deviceName);
++-      return nullptr;
++     }
++     if (REXCVAR_GET(vulkan_require_geometry_shader) && !supported_features.geometryShader) {
++       REXLOG_WARN(
+-- 
+2.43.0
+
