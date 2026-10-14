@@ -31,6 +31,10 @@ for so in librexgpu-xenosrd.so; do
   gone="$(comm -23 a.txt b.txt)"
   if [ -n "$gone" ]; then echo "Symbols gone from $so:"; echo "$gone" | head -50; exit 1; fi
 done
+# Proof that the rebuilt libraries carry the Mali patch.
+grep -q "memory export will be skipped" new/lib/arm64-v8a/librexruntimerd.so || { echo "runtime lacks the patch"; exit 1; }
+grep -q "Vertex shader memexport skipped" new/lib/arm64-v8a/librexgpu-xenosrd.so || { echo "GPU plugin lacks the patch"; exit 1; }
+grep -q "vertex shader memory export is skipped" new/lib/arm64-v8a/librb2probe.so || { echo "probe lacks the patch"; exit 1; }
 # Replace the libraries (stored, like the original), align and sign.
 cp official.apk unsigned.apk
 zip -q -d unsigned.apk 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.EC' 'META-INF/*.MF' || true
@@ -42,3 +46,9 @@ keytool -genkeypair -keystore rb2mali.jks -alias rb2mali -keyalg RSA -keysize 20
   --out RB2-Android-Mali.apk aligned.apk
 "$BT/apksigner" verify --print-certs RB2-Android-Mali.apk | head -3
 ls -la RB2-Android-Mali.apk
+summary="patch strings found in all 3 libs; libmain needs $(wc -l < need_from_runtime.txt) runtime symbols, all present"
+for so in librexruntimerd.so librexgpu-xenosrd.so librb2probe.so; do
+  summary="$summary%0A$so: official $(stat -c%s old/lib/arm64-v8a/$so) B, new $(stat -c%s new/lib/arm64-v8a/$so) B"
+done
+summary="$summary%0AAPK sha256 $(sha256sum RB2-Android-Mali.apk | cut -c1-64), $(stat -c%s RB2-Android-Mali.apk) B"
+echo "::notice title=Mali APK check::$summary"
