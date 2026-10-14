@@ -19,6 +19,9 @@ env:
   CMAKE_VERSION: 3.31.6
   BUILD_TOOLS: 35.0.0
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -58,3 +61,12 @@ jobs:
           name: RB2-Android-Mali
           path: ~/work/apk/RB2-Android-Mali.apk
           retention-days: 30
+
+      - name: Publish as a release (direct download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete mali-v1.2.3 --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create mali-v1.2.3 ~/work/apk/RB2-Android-Mali.apk --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "RB2-Android 1.2.3 - Mali" \
+            --notes "RB2-Android v1.2.3 with the Mali patch (engine libraries rebuilt). Uninstall the official app first, install this APK, then select your own ISO again."
